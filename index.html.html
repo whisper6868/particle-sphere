@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>粒子球 · 手势交互 v2</title>
+<script src="https://unpkg.com/@mediapipe/hands/hands.js"></script>
+<script src="https://unpkg.com/@mediapipe/camera_utils/camera_utils.js"></script>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#000; overflow:hidden; width:100vw; height:100vh; }
+canvas { position:fixed; top:0; left:0; }
+#video { position:fixed; opacity:0; width:1px; height:1px; }
+#status {
+  position:fixed; top:20px; left:50%; transform:translateX(-50%);
+  color:rgba(0,255,200,0.5); font-family:'Courier New',monospace;
+  font-size:12px; letter-spacing:0.3em; pointer-events:none;
+}
+#hint {
+  position:fixed; bottom:20px; left:50%; transform:translateX(-50%);
+  color:rgba(0,255,180,0.2); font-family:'Courier New',monospace;
+  font-size:11px; letter-spacing:0.2em; pointer-events:none;
+}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<video id="video" playsinline></video>
+<div id="status">正在加载...</div>
+<div id="hint">张开手放大散开 · 握拳缩小聚合 · 左右移动旋转</div>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const statusEl = document.getElementById('status');
+const video = document.getElementById('video');
+
+let W = canvas.width = window.innerWidth;
+let H = canvas.height = window.innerHeight;
+
+const CX = () => W / 2;
+const CY = () => H / 2;
+
+// ── 背景星点 ──
+const STARS = Array.from({length:350}, () => ({
+  x: Math.random()*W, y: Math.random()*H,
+  r: Math.random()*1.5+0.3,
+  a: Math.random()*0.5+0.15,
+  phase: Math.random()*Math.PI*2,
+}));
+
+// ── 每个粒子 ──
+const N = 3000;
+let particles = [];
+
+function makeSpherePoint(radius) {
+  // 球面均匀采样
+  const u = Math.random(), v = Math.random();
+  const theta = 2 * Math.PI * u;
+  const phi = Math.acos(2 * v - 1);
+  const r = radius + (Math.random()-0.5)*8;
+  return {
+    // 目标球面位置（本地坐标）
+    tx: r * Math.sin(phi)*Math.cos(theta),
+    ty: r * Math.cos(phi),
+    tz: r * Math.sin(phi)*Math.sin(theta),
+    // 当前世界位置（带旋转后投影）
+    cx: CX(), cy: CY(),   // 屏幕位置
+    // 球面角（用于旋转）
+    theta, phi,
+    r,
+    baseR: radius,
+    size: 0.7 + Math.random()*1.5,
+    brightness: 0.4 + Math.random()*0.6,
+    // 散开态：随机飞散方向
+    scatterVx: (Math.random()-0.5)*4,
+    scatterVy: (Math.random()-0.5)*4,
+    // 当前散开程度 0=聚合 1=完全散开
+    scatter: 0,
+    scatterX: 0, scatterY: 0, // 累计散开偏移
+  };
+}
+
+function init() {
+  particles = Array.from({length: N}, () => makeSpherePoint(240));
+}
+init();
+
+// ── 旋转状态 ──
+let rotY = 0;
+let autoRotSpeed = 0.005;
+
+// ── 手势 ──
+let hand = {
+  detected: false,
+  palmX: 0.5, prevPalmX: 0.5,
+  openness: 1,   // 0=握拳 1=张开
+  smoothOpen: 1,
+};
+
+function getOpenness(lm) {
+  // 用4根手指（食中无小）指尖距手腕的距离 vs 掌根距离
+  const w = lm[0];
+  const fingerTips = [8,12,16,20];
+  const fingerMCP  = [5, 9,13,17];
+  let sum = 0;
+  fingerTips.forEach((ti,i)=>{
+    const tip = lm[ti], mcp = lm[fingerMCP[i]];
+    const tipD = Math.hypot(tip.x-w.x, tip.y-w.y);
+    const mcpD = Math.hypot(mcp.x-w.x, mcp.y-w.y);
+    sum += tipD / (mcpD+0.001);
+  });
+  const avg = sum/4;
+  return Math.max(0, Math.min(1, (avg-1.0)/1.4));
+}
+
+const hands = new Hands({
+  locateFile: f=>`https://unpkg.com/@mediapipe/hands/${f}`
+});
+hands.setOptions({ maxNumHands:1, modelComplexity:1,
+  minDetectionConfidence:0.6, minTrackingConfidence:0.5 });
+
+hands.onResults(res => {
+  if (res.multiHandLandmarks && res.multiHandLandmarks.length>0) {
+    const lm = res.multiHandLandmarks[0];
+    hand.detected = true;
+    hand.prevPalmX = hand.palmX;
+    hand.palmX = 1 - lm[9].x;  // 镜像
+    hand.openness = getOpenness(lm);
+    statusEl.style.opacity = 0;
+  } else {
+    hand.detected = false;
+    hand.openness = 1;
+    statusEl.style.opacity = 1;
+    statusEl.textContent = '请将手放入摄像头';
+  }
+});
+
+const camera = new Camera(video, {
+  onFrame: async()=>{ await hands.send({image:video}); },
+  width:640, height:480,
+});
+camera.start().then(()=>{
+  statusEl.textContent='请将手放入摄像头';
+}).catch(()=>{
+  statusEl.textContent='请允许摄像头权限后刷新';
+});
+
+// ── 3D旋转 ──
+function rotateY(x,z,a){ return { x:x*Math.cos(a)-z*Math.sin(a), z:x*Math.sin(a)+z*Math.cos(a) }; }
+function rotateX(y,z,a){ return { y:y*Math.cos(a)-z*Math.sin(a), z:y*Math.sin(a)+z*Math.cos(a) }; }
+
+const ROT_X = 0.25; // 固定X轴倾斜
+let targetRadius = 240;
+let currentRadius = 240;
+
+// ── 主循环 ──
+let frame = 0;
+function loop() {
+  requestAnimationFrame(loop);
+  frame++;
+
+  // 残影
+  ctx.fillStyle='rgba(0,2,8,0.17)';
+  ctx.fillRect(0,0,W,H);
+
+  // 背景星星
+  STARS.forEach(s=>{
+    s.phase+=0.018;
+    const a = s.a*(0.5+0.5*Math.sin(s.phase));
+    ctx.beginPath();
+    ctx.arc(s.x,s.y,s.r,0,Math.PI*2);
+    ctx.fillStyle=`rgba(80,230,200,${a})`;
+    ctx.fill();
+  });
+
+  // 手势处理
+  hand.smoothOpen += (hand.openness - hand.smoothOpen)*0.15;
+
+  if (hand.detected) {
+    // 左右移动 → 旋转
+    const dx = hand.palmX - hand.prevPalmX;
+    rotY -= dx * 20;
+    // 开合 → 目标半径
+    targetRadius = 150 + hand.smoothOpen * 200; // 80~220
+  } else {
+    rotY += autoRotSpeed;
+  }
+
+  currentRadius += (targetRadius - currentRadius)*0.1;
+
+  // 更新每个粒子
+  const targetScatter = hand.smoothOpen; // 0=聚合 1=散开
+  
+  // 收集粒子3D信息用于排序
+  const drawList = [];
+
+  particles.forEach(p => {
+    // 粒子半径跟随球体半径
+    const rScale = currentRadius / p.baseR;
+    const localX = p.tx * rScale;
+    const localY = p.ty * rScale;
+    const localZ = p.tz * rScale;
+
+    // 旋转
+    const ry = rotateY(localX, localZ, rotY);
+    const rx = rotateX(localY, ry.z, ROT_X);
+
+    const wx = CX() + ry.x;
+    const wy = CY() + rx.y;
+    const wz = rx.z;
+
+    // 散开：粒子从球面位置向随机方向飞散
+    p.scatter += (targetScatter - p.scatter)*0.12;
+    p.scatterX = p.scatterVx * p.scatter * 60;
+    p.scatterY = p.scatterVy * p.scatter * 60;
+
+    const fx = wx + p.scatterX;
+    const fy = wy + p.scatterY;
+
+    drawList.push({ x:fx, y:fy, z:wz, size:p.size, brightness:p.brightness, scatter:p.scatter });
+  });
+
+  // 按z排序（远→近）
+  drawList.sort((a,b)=>a.z-b.z);
+
+  const maxZ = currentRadius;
+  drawList.forEach(p => {
+    const depth = (p.z + maxZ)/(2*maxZ); // 0~1
+    const alpha = (0.2 + depth*0.8) * p.brightness * (1 - p.scatter*0.3);
+    const sz = p.size*(0.4+depth*0.8);
+
+    const g = Math.floor(160 + depth*95);
+    const b = Math.floor(190 + depth*65);
+    const rr = Math.floor(depth*15);
+
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, Math.max(0.3,sz), 0, Math.PI*2);
+    ctx.fillStyle=`rgba(${rr},${g},${b},${alpha})`;
+    ctx.fill();
+  });
+
+  // 中心核心发光
+  const coreR = currentRadius * 0.18 * (1 - hand.smoothOpen*0.5);
+  if (coreR > 2) {
+    const g1 = ctx.createRadialGradient(CX(),CY(),0, CX(),CY(),coreR*3);
+    g1.addColorStop(0,'rgba(200,255,255,0.9)');
+    g1.addColorStop(0.3,'rgba(0,230,210,0.4)');
+    g1.addColorStop(1,'rgba(0,0,0,0)');
+    ctx.beginPath();
+    ctx.arc(CX(),CY(),coreR*3,0,Math.PI*2);
+    ctx.fillStyle=g1;
+    ctx.fill();
+  }
+
+  // 外层光晕
+  const haloR = currentRadius*1.15;
+  const g2 = ctx.createRadialGradient(CX(),CY(),currentRadius*0.8, CX(),CY(),haloR);
+  g2.addColorStop(0,'rgba(0,200,180,0.04)');
+  g2.addColorStop(1,'rgba(0,0,0,0)');
+  ctx.beginPath();
+  ctx.arc(CX(),CY(),haloR,0,Math.PI*2);
+  ctx.fillStyle=g2;
+  ctx.fill();
+}
+
+window.addEventListener('resize',()=>{
+  W=canvas.width=window.innerWidth;
+  H=canvas.height=window.innerHeight;
+  STARS.forEach(s=>{s.x=Math.random()*W;s.y=Math.random()*H;});
+});
+
+window.addEventListener('keydown',e=>{
+  if(e.code==='Space'){ctx.fillStyle='#000';ctx.fillRect(0,0,W,H);}
+});
+
+loop();
+</script>
+</body>
+</html>
